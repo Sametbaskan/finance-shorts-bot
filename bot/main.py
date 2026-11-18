@@ -112,7 +112,8 @@ def load_history():
 
 def save_history(h):
     for k in h:
-        h[k] = h[k][-300:]
+        if isinstance(h[k], list):
+            h[k] = h[k][-300:]
     HISTORY_FILE.write_text(json.dumps(h, indent=1, ensure_ascii=False), encoding="utf-8")
 
 
@@ -472,22 +473,27 @@ def tg(method, **kw):
     return r
 
 
-def tg_chat_id():
+def tg_chat_id(history=None):
     if TG_CHAT:
         return TG_CHAT
+    if history and history.get("tg_chat_id"):
+        return history["tg_chat_id"]
     r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", timeout=30).json()
     for upd in reversed(r.get("result", [])):
         msg = upd.get("message") or upd.get("channel_post")
         if msg:
-            return str(msg["chat"]["id"])
+            cid = str(msg["chat"]["id"])
+            if history is not None:
+                history["tg_chat_id"] = cid  # Telegram mesajlari 24 saat tutar, ID'yi kalici kaydet
+            return cid
     return ""
 
 
-def send_telegram(video, meta):
+def send_telegram(video, meta, history):
     if not TG_TOKEN:
         log("Telegram ayarlanmamis, video sadece GitHub'da 'Artifacts' altinda.")
         return
-    chat = tg_chat_id()
+    chat = tg_chat_id(history)
     if not chat:
         log("Chat ID bulunamadi. Botuna Telegram'dan bir mesaj at ve tekrar calistir.")
         return
@@ -500,7 +506,7 @@ def send_telegram(video, meta):
 
 def tg_error(text):
     if TG_TOKEN:
-        chat = tg_chat_id()
+        chat = tg_chat_id(load_history())
         if chat:
             tg("sendMessage", data={"chat_id": chat, "text": f"Shorts botu hata verdi:\n{text[:3500]}"})
 
@@ -546,7 +552,7 @@ def main():
     (OUT / "meta.txt").write_text(meta_text(meta), encoding="utf-8")
     log(f"Video hazir: {video.name} ({video.stat().st_size / 1e6:.1f} MB)")
 
-    send_telegram(video, meta)
+    send_telegram(video, meta, history)
     history["topics"].append(meta["topic"])
     history["titles"].append(meta["title"])
     save_history(history)

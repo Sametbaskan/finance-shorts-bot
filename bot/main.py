@@ -40,11 +40,14 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 VOICE = os.getenv("VOICE", "en-US-AndrewNeural")
 VOICE_RATE = os.getenv("VOICE_RATE", "+10%")
-GEMINI_MODELS = [m for m in [os.getenv("GEMINI_MODEL", "")] if m] + [
-    "gemini-2.5-flash",
+GEMINI_PREFERRED = [m for m in [os.getenv("GEMINI_MODEL", "")] if m] + [
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
     "gemini-flash-latest",
-    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
 ]
+_GEMINI_MODELS = None
 
 # ---------------------------------------------------------------- konular
 TOPICS = [
@@ -150,30 +153,68 @@ Return ONLY JSON in exactly this shape:
 }}"""
 
 
+def gemini_models():
+    """Tercih listesi + bu API anahtarinda gercekten acik olan 'flash' modelleri."""
+    global _GEMINI_MODELS
+    if _GEMINI_MODELS is not None:
+        return _GEMINI_MODELS
+    available = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"key": GEMINI_KEY, "pageSize": 200}, timeout=30)
+        r.raise_for_status()
+        for m in r.json().get("models", []):
+            name = m["name"].split("/")[-1]
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            if "flash" not in name or re.search(r"tts|live|image|audio|embed|vision", name):
+                continue
+            available.append(name)
+        log(f"Hesaptaki flash modelleri: {', '.join(available) or '(yok)'}")
+    except Exception as e:
+        log(f"Model listesi alinamadi: {e}")
+    if available:
+        ordered = [m for m in GEMINI_PREFERRED if m in available]
+        # listede olup tercihte olmayanlari en yeni surum once gelecek sekilde ekle
+        ordered += sorted([m for m in available if m not in ordered and "preview" not in m], reverse=True)
+        ordered += [m for m in available if m not in ordered]
+    else:
+        ordered = list(GEMINI_PREFERRED)
+    _GEMINI_MODELS = ordered
+    return ordered
+
+
 def call_gemini(prompt):
-    last_err = None
-    for model in GEMINI_MODELS:
+    errors = []
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 1.0, "responseMimeType": "application/json"},
+    }
+    for model in gemini_models()[:8]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        body = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 1.0, "responseMimeType": "application/json"},
-        }
         try:
-            r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=90)
-            if r.status_code in (404, 400) and "not found" in r.text.lower():
-                last_err = f"{model}: model bulunamadi"
+            r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=120)
+            if not r.ok:
+                try:
+                    msg = r.json().get("error", {}).get("message", r.text)
+                except Exception:
+                    msg = r.text
+                errors.append(f"{model}: HTTP {r.status_code} {msg[:160]}")
+                if r.status_code == 429:
+                    time.sleep(5)
                 continue
-            if r.status_code == 429:
-                last_err = f"{model}: kota doldu (429)"
-                time.sleep(10)
+            parts = r.json()["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+            if not text.strip():
+                errors.append(f"{model}: bos cevap")
                 continue
-            r.raise_for_status()
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
             log(f"Gemini modeli: {model}")
             return text
         except Exception as e:
-            last_err = f"{model}: {e}"
-    raise RuntimeError(f"Gemini cevap vermedi. Son hata: {last_err}")
+            errors.append(f"{model}: {e}")
+    for e in errors:
+        log("  " + e)
+    raise RuntimeError("Gemini cevap vermedi:\n" + "\n".join(errors[-4:]))
 
 
 def parse_json(text):
